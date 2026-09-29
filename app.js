@@ -6,7 +6,7 @@ import {
 import {
   getFirestore, connectFirestoreEmulator, collection, doc, query, where, orderBy, limit,
   startAfter, getDocs, getDoc, runTransaction, writeBatch, updateDoc, serverTimestamp,
-  setDoc, deleteDoc
+  setDoc, deleteDoc, getCountFromServer
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 import { firebaseConfig, ADMIN_EMAIL, DATABASE_ID } from "./firebase-config.js";
 
@@ -19,7 +19,7 @@ if (location.hostname === "localhost" && new URLSearchParams(location.search).ha
   connectFirestoreEmulator(db, "localhost", 8080);
 }
 
-const PAGE = 20;
+const PAGE = 10; // 한 페이지에 보여줄 글 수
 const POST_MAX = 2000;
 const COMMENT_MAX = 500;
 const REPORT_LIMIT = 3;
@@ -238,7 +238,7 @@ async function myKey(postId) {
   if (!keyCache.has(k)) keyCache.set(k, await sha(k));
   return keyCache.get(k);
 }
-const feed = { posts: [], last: null, done: false, loading: false, loaded: false, mode: "open" };
+const feed = { posts: [], page: 1, total: null, cursors: {}, loading: false, loaded: false, mode: "open", error: null };
 let detail = null; // { id, post, comments }
 
 /* ───────────── 테마 적용 ───────────── */
@@ -273,8 +273,14 @@ function setTheme(k) {
 function currentRoute() {
   const m = location.hash.match(/^#\/p\/([\w-]+)/);
   if (m) return { name: "post", id: m[1] };
-  if (location.hash.startsWith("#/hidden")) return { name: "hidden" };
-  return { name: "feed" };
+  const hm = location.hash.match(/^#\/hidden(?:\/(\d+))?/);
+  if (hm) return { name: "hidden", page: Math.max(1, +(hm[1] || 1)) };
+  const pm = location.hash.match(/^#\/page\/(\d+)/);
+  return { name: "feed", page: pm ? Math.max(1, +pm[1]) : 1 };
+}
+function pageHref(mode, n) {
+  if (mode === "hidden") return n > 1 ? `#/hidden/${n}` : "#/hidden";
+  return n > 1 ? `#/page/${n}` : "#/";
 }
 async function route() {
   const r = currentRoute();
@@ -283,7 +289,11 @@ async function route() {
     if (!detail || detail.id !== r.id) await loadDetail(r.id);
   } else {
     const mode = r.name === "hidden" && isAdmin ? "hidden" : "open";
-    if (!feed.loaded || feed.mode !== mode) await loadFeed(true, mode);
+    if (!feed.loaded || feed.mode !== mode || feed.page !== r.page) {
+      const prevPage = feed.page;
+      await loadPage(r.page, mode, feed.mode !== mode);
+      if (feed.loaded && prevPage !== feed.page) window.scrollTo(0, 0);
+    }
   }
   render();
   if (r.name === "post") window.scrollTo(0, 0);
@@ -298,22 +308,47 @@ function render() {
 
 /* ───────────── 데이터: 목록 ───────────── */
 let feedSeq = 0;
-async function loadFeed(reset, mode = feed.mode) {
-  if (!reset && (feed.loading || feed.done)) return;
-  if (reset) Object.assign(feed, { posts: [], last: null, done: false, loaded: false, mode, error: null });
+function feedConstraints(mode) {
+  return mode === "hidden"
+    ? [where("hidden", "==", true), orderBy("createdAt", "desc")]
+    : [where("hidden", "==", false), where("deleted", "==", false), orderBy("createdAt", "desc")];
+}
+// page 번호의 글을 불러옴. reset=true면 총 개수·페이지 위치 기억을 새로 계산
+async function loadPage(page, mode = feed.mode, reset = false) {
+  if (reset || mode !== feed.mode) Object.assign(feed, { total: null, cursors: {}, mode });
   const seq = ++feedSeq;
-  feed.loading = true;
+  Object.assign(feed, { loading: true, error: null, page });
+  if (!feed.loaded) render();
   try {
-    const parts = [collection(db, "posts"), where("hidden", "==", mode === "hidden"), orderBy("createdAt", "desc")];
-    if (feed.last) parts.push(startAfter(feed.last));
+    const col = collection(db, "posts");
+    const base = feedConstraints(mode);
+    if (feed.total == null) {
+      const c = await withTimeout(getCountFromServer(query(col, ...base)));
+      if (seq !== feedSeq) return;
+      feed.total = c.data().count;
+    }
+    const pages = Math.max(1, Math.ceil(feed.total / PAGE));
+    if (page > pages) page = pages;
+    feed.page = page;
+    // 앞 페이지의 마지막 글(커서)을 알아야 해당 페이지부터 가져올 수 있음
+    let after = null;
+    if (page > 1) {
+      after = feed.cursors[page];
+      if (!after) {
+        const skip = await withTimeout(getDocs(query(col, ...base, limit((page - 1) * PAGE))));
+        if (seq !== feedSeq) return;
+        after = skip.docs[skip.docs.length - 1] || null;
+        feed.cursors[page] = after;
+      }
+    }
+    const parts = [...base];
+    if (after) parts.push(startAfter(after));
     parts.push(limit(PAGE));
-    const snap = await withTimeout(getDocs(query(...parts)));
-    if (seq !== feedSeq) return; // 더 새로운 요청이 있으면 무시
-    snap.forEach((d) => feed.posts.push({ id: d.id, ...d.data() }));
-    feed.last = snap.docs[snap.docs.length - 1] || feed.last;
-    if (snap.size < PAGE) feed.done = true;
+    const snap = await withTimeout(getDocs(query(col, ...parts)));
+    if (seq !== feedSeq) return;
+    feed.posts = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    if (snap.docs.length) feed.cursors[page + 1] = snap.docs[snap.docs.length - 1];
     feed.loaded = true;
-    feed.error = null;
   } catch (e) {
     if (seq !== feedSeq) return;
     console.error(e);
@@ -321,6 +356,10 @@ async function loadFeed(reset, mode = feed.mode) {
   } finally {
     if (seq === feedSeq) feed.loading = false;
   }
+}
+// 글 추가·삭제 뒤 현재 페이지를 새로 계산해서 다시 불러옴
+async function reloadFeed(page = feed.page) {
+  await loadPage(page, feed.mode, true);
 }
 
 /* ───────────── 데이터: 상세 ───────────── */
@@ -385,23 +424,41 @@ function renderFeed() {
       h("strong", {}, "가려진 글 목록"), h("a", { href: "#/" }, "← 전체 글로")));
   }
   if (feed.error) {
-    frag.append(errorBox(feed.error, async () => { await loadFeed(true, feed.mode); render(); }));
+    frag.append(errorBox(feed.error, async () => { await reloadFeed(); render(); }));
     return frag;
   }
-  if (!feed.loaded && feed.loading) frag.append(h("p", { class: "empty" }, "불러오는 중…"));
-  const shown = feed.posts.filter((p) => isAdmin || !p.deleted || p.commentCount > 0);
-  if (feed.loaded && shown.length === 0) {
+  if (!feed.loaded) { frag.append(h("p", { class: "empty" }, "불러오는 중…")); return frag; }
+  if (feed.posts.length === 0) {
     frag.append(h("p", { class: "empty" }, feed.mode === "hidden" ? "가려진 글이 없어요." : t.empty));
   }
-  shown.forEach((p) => frag.append(postCard(p)));
-  if (feed.loaded && !feed.done) {
-    const more = h("button", {
-      type: "button", class: "btn ghost wide",
-      onclick: async () => { more.disabled = true; more.textContent = "불러오는 중…"; await loadFeed(false); render(); },
-    }, "더 보기");
-    frag.append(more);
-  }
+  const list = h("div", { class: `feed-list${feed.loading ? " is-loading" : ""}` });
+  feed.posts.forEach((p) => list.append(postCard(p)));
+  frag.append(list);
+  frag.append(pager());
   return frag;
+}
+// 페이지 번호: « ‹ 1 2 3 4 5 › »  (최대 5개씩 묶어서 표시)
+function pager() {
+  const pages = Math.max(1, Math.ceil((feed.total || 0) / PAGE));
+  if (pages <= 1) return document.createDocumentFragment();
+  const cur = feed.page, mode = feed.mode;
+  const GROUP = 5;
+  const first = Math.floor((cur - 1) / GROUP) * GROUP + 1;
+  const last = Math.min(pages, first + GROUP - 1);
+  const nav = h("nav", { class: "pager", "aria-label": "페이지" });
+  const link = (n, label, aria, disabled) => disabled
+    ? h("span", { class: "pg disabled", "aria-hidden": "true" }, label)
+    : h("a", { class: "pg", href: pageHref(mode, n), "aria-label": aria }, label);
+  nav.append(link(1, "«", "첫 페이지", cur === 1));
+  nav.append(link(Math.max(1, first - 1), "‹", "이전 묶음", first === 1));
+  for (let n = first; n <= last; n++) {
+    nav.append(n === cur
+      ? h("span", { class: "pg current", "aria-current": "page" }, String(n))
+      : link(n, String(n), `${n}페이지`));
+  }
+  nav.append(link(Math.min(pages, last + 1), "›", "다음 묶음", last === pages));
+  nav.append(link(pages, "»", "마지막 페이지", cur === pages));
+  return nav;
 }
 
 /* ───────────── 화면: 상세 ───────────── */
@@ -500,9 +557,13 @@ function openCompose() {
         const id = await withTimeout(createPost(body, pw.value));
         close();
         toast("등록되었어요.");
-        await loadFeed(true, "open");
-        location.hash = "#/";
-        render();
+        if (feed.mode === "open" && feed.page === 1 && currentRoute().name === "feed") {
+          await reloadFeed(1); render();
+        } else {
+          Object.assign(feed, { loaded: false, mode: "open", total: null, cursors: {} });
+          if (location.hash === "#/" || location.hash === "") await route();
+          else location.hash = "#/";
+        }
         void id;
       } catch (err) {
         console.error(err);
@@ -629,6 +690,42 @@ async function toggleBan(path) {
   return true;
 }
 
+/* ───────────── 관리자: 완전 삭제 ───────────── */
+// 글과 그 아래 딸린 모든 기록(댓글, 신고, 작성자 기록, 비밀번호 등)을 DB에서 지움. 되돌릴 수 없음.
+async function commitDeletes(refs) {
+  for (let i = 0; i < refs.length; i += 400) {
+    const b = writeBatch(db);
+    refs.slice(i, i + 400).forEach((r) => b.delete(r));
+    await b.commit();
+  }
+}
+async function commentRefs(cRef) {
+  const refs = [doc(cRef, "owner", "info")];
+  const reps = await getDocs(collection(cRef, "reports"));
+  reps.forEach((d) => refs.push(d.ref));
+  refs.push(cRef);
+  return refs;
+}
+async function purgePost(postId) {
+  const postRef = doc(db, "posts", postId);
+  const refs = [];
+  const comments = await getDocs(collection(postRef, "comments"));
+  for (const c of comments.docs) refs.push(...(await commentRefs(c.ref)));
+  for (const sub of ["members", "reports"]) {
+    (await getDocs(collection(postRef, sub))).forEach((d) => refs.push(d.ref));
+  }
+  refs.push(doc(postRef, "secret", "del"), doc(postRef, "owner", "info"));
+  await commitDeletes(refs);
+  await deleteDoc(postRef); // 본문은 마지막에 삭제
+}
+async function purgeComment(postId, cid) {
+  const postRef = doc(db, "posts", postId);
+  const cRef = doc(postRef, "comments", cid);
+  await commitDeletes(await commentRefs(cRef));
+  const p = await getDoc(postRef);
+  if (p.exists()) await updateDoc(postRef, { commentCount: Math.max(0, (p.data().commentCount || 1) - 1) });
+}
+
 /* ───────────── 글 메뉴 ───────────── */
 async function postMenu(p) {
   const t = T();
@@ -640,6 +737,7 @@ async function postMenu(p) {
     if (p.hidden) items.push({ key: "unhide", label: "[관리] 가림 해제" });
     else items.push({ key: "hide", label: "[관리] 가리기" });
     items.push({ key: "ban", label: "[관리] 작성자 차단 / 해제", danger: true });
+    items.push({ key: "purge", label: "[관리] 완전 삭제", danger: true });
   }
   const k = await menu(items);
   try {
@@ -649,10 +747,20 @@ async function postMenu(p) {
     else if (k === "unhide") { await updateDoc(doc(db, "posts", p.id), { hidden: false, reportCount: 0 }); toast("가림을 해제했어요."); await afterChange(p.id); }
     else if (k === "hide") { await updateDoc(doc(db, "posts", p.id), { hidden: true }); toast("글을 가렸어요."); await afterChange(p.id); }
     else if (k === "ban") { if (await toggleBan(`posts/${p.id}`)) render(); }
+    else if (k === "purge") {
+      if (!(await confirmBox("이 글을 완전히 삭제할까요?\n댓글·신고 기록까지 모두 지워지고 되돌릴 수 없어요.\n(글 번호는 비어 있는 채로 남아요)", "완전 삭제", true))) return;
+      await purgePost(p.id);
+      toast("완전히 삭제했어요.");
+      detail = null;
+      if (currentRoute().name === "post") {
+        Object.assign(feed, { loaded: false, total: null, cursors: {} });
+        location.hash = pageHref(feed.mode, feed.page);
+      } else { await reloadFeed(); render(); }
+    }
   } catch (e) { toast(errMsg(e)); }
 }
 async function afterChange(postId) {
-  await loadFeed(true, feed.mode);
+  await reloadFeed();
   if (detail && detail.id === postId) await loadDetail(postId);
   render();
 }
@@ -704,6 +812,7 @@ async function commentMenu(c) {
   if (isAdmin) {
     items.push(c.hidden ? { key: "unhide", label: "[관리] 가림 해제" } : { key: "hide", label: "[관리] 가리기" });
     items.push({ key: "ban", label: "[관리] 작성자 차단 / 해제", danger: true });
+    items.push({ key: "purge", label: "[관리] 완전 삭제", danger: true });
   }
   if (!items.length) { toast("이 댓글은 작성한 브라우저에서만 삭제할 수 있어요."); return; }
   const k = await menu(items);
@@ -730,6 +839,10 @@ async function commentMenu(c) {
     } else if (k === "ban") {
       if (await toggleBan(`posts/${detail.id}/comments/${c.id}`)) render();
       return;
+    } else if (k === "purge") {
+      if (!(await confirmBox("이 댓글을 완전히 삭제할까요?\n되돌릴 수 없어요.", "완전 삭제", true))) return;
+      await purgeComment(detail.id, c.id);
+      toast("완전히 삭제했어요.");
     } else if (k === "hide") {
       await updateDoc(cRef, { hidden: true });
     } else return;

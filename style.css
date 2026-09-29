@@ -118,7 +118,8 @@ button { font: inherit; color: inherit; cursor: pointer; }
 
 /* ═════════════ 본문 ═════════════ */
 #view { padding-top: 18px; padding-bottom: 110px; min-height: 60vh; }
-.feed, .detail { display: flex; flex-direction: column; gap: 12px; }
+.feed, .detail, .feed-list { display: flex; flex-direction: column; gap: 12px; }
+.feed-list.is-loading { opacity: .5; pointer-events: none; transition: opacity .15s; }
 .empty { text-align: center; color: var(--sub); padding: 40px 0; margin: 0; }
 .empty.small { padding: 12px 0; font-size: 13px; }
 .muted { color: var(--sub); font-style: italic; }
@@ -297,3 +298,16 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .owner-tag.banned { text-decoration: line-through; }
 .ban-row { display: flex; justify-content: space-between; align-items: center; padding: 8px 0; border-bottom: 1px solid var(--line); font-family: var(--font-no); }
 .ban-row small { color: var(--sub); font-family: var(--font-body); }
+
+/* ═════════════ 페이지 번호 ═════════════ */
+.pager { display: flex; justify-content: center; align-items: center; gap: 4px; margin: 10px 0 0; flex-wrap: wrap; }
+.pg {
+  min-width: 36px; height: 36px; padding: 0 6px;
+  display: inline-grid; place-items: center;
+  border: 1px solid var(--line); border-radius: var(--radius);
+  background: var(--paper); color: var(--ink);
+  font-family: var(--font-no); font-size: 14px; text-decoration: none;
+}
+[data-theme="daydream"] .pg { border-radius: 10px; border-color: transparent; box-shadow: var(--shadow); }
+.pg.current { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 700; }
+.pg.disabled { opacity: .3; }
