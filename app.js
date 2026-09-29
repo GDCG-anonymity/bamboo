@@ -141,9 +141,34 @@ function toast(msg) {
 function errMsg(e) {
   console.error(e);
   if (e && e.message && e.message.startsWith("!")) return e.message.slice(1);
-  if (e && e.code === "permission-denied") return "너무 빠르게 작성했거나 권한이 없어요. 잠시 후 다시 시도해주세요.";
-  if (e && e.code === "unavailable") return "연결이 불안정해요. 잠시 후 다시 시도해주세요.";
-  return "문제가 생겼어요. 잠시 후 다시 시도해주세요.";
+  const code = e && e.code ? ` (${e.code})` : "";
+  if (e && e.code === "permission-denied") return "너무 빠르게 작성했거나 권한이 없어요. 잠시 후 다시 시도해주세요." + code;
+  if (e && (e.code === "unavailable" || e.code === "deadline-exceeded")) return "서버에 연결하지 못했어요. 잠시 후 다시 시도해주세요." + code;
+  if (e && e.code === "failed-precondition") return "데이터베이스 색인이 아직 준비되지 않았어요." + code;
+  return "문제가 생겼어요. 잠시 후 다시 시도해주세요." + code;
+}
+// 오류 원인 확인용 상세 문구 (화면에 그대로 표시)
+function errDetail(e) {
+  const code = (e && e.code) || "unknown";
+  const msg = (e && e.message) || String(e);
+  let hint = "";
+  if (code === "permission-denied") hint = "Firestore 규칙이 게시됐는지, Authentication에서 '익명' 로그인이 켜져 있는지 확인해주세요.";
+  else if (code === "failed-precondition") hint = "색인이 필요해요. F12 콘솔의 링크를 눌러 색인을 만들고 몇 분 기다려주세요.";
+  else if (code === "unavailable" || code === "deadline-exceeded" || code === "timeout") hint = "Firestore 데이터베이스가 만들어져 있는지 확인해주세요.";
+  else if (code === "not-found") hint = "Firestore 데이터베이스가 없거나 이름이 (default)가 아니에요.";
+  else if (String(code).startsWith("auth/")) hint = "Authentication에서 '익명' 로그인이 켜져 있는지, 승인된 도메인에 github.io 주소가 있는지 확인해주세요.";
+  return { code, msg, hint };
+}
+function withTimeout(p, ms = 15000) {
+  return Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(Object.assign(new Error("서버 응답이 없어요"), { code: "timeout" })), ms))]);
+}
+function errorBox(e, retry) {
+  const d = errDetail(e);
+  return h("div", { class: "error-box" },
+    h("strong", {}, "불러오지 못했어요"),
+    d.hint ? h("p", {}, d.hint) : null,
+    h("p", { class: "error-code" }, `${d.code}: ${d.msg}`),
+    retry ? h("button", { type: "button", class: "btn ghost small", onclick: retry }, "다시 시도") : null);
 }
 
 /* ───────────── 시트/대화상자 ───────────── */
@@ -271,24 +296,29 @@ function render() {
 }
 
 /* ───────────── 데이터: 목록 ───────────── */
+let feedSeq = 0;
 async function loadFeed(reset, mode = feed.mode) {
-  if (feed.loading) return;
-  if (reset) Object.assign(feed, { posts: [], last: null, done: false, mode });
-  if (feed.done) return;
+  if (!reset && (feed.loading || feed.done)) return;
+  if (reset) Object.assign(feed, { posts: [], last: null, done: false, loaded: false, mode, error: null });
+  const seq = ++feedSeq;
   feed.loading = true;
   try {
     const parts = [collection(db, "posts"), where("hidden", "==", mode === "hidden"), orderBy("createdAt", "desc")];
     if (feed.last) parts.push(startAfter(feed.last));
     parts.push(limit(PAGE));
-    const snap = await getDocs(query(...parts));
+    const snap = await withTimeout(getDocs(query(...parts)));
+    if (seq !== feedSeq) return; // 더 새로운 요청이 있으면 무시
     snap.forEach((d) => feed.posts.push({ id: d.id, ...d.data() }));
     feed.last = snap.docs[snap.docs.length - 1] || feed.last;
     if (snap.size < PAGE) feed.done = true;
     feed.loaded = true;
+    feed.error = null;
   } catch (e) {
-    toast(errMsg(e));
+    if (seq !== feedSeq) return;
+    console.error(e);
+    feed.error = e;
   } finally {
-    feed.loading = false;
+    if (seq === feedSeq) feed.loading = false;
   }
 }
 
@@ -297,14 +327,15 @@ async function loadDetail(id) {
   detail = { id, post: null, comments: [], state: "loading" };
   render();
   try {
-    const snap = await getDoc(doc(db, "posts", id));
+    const snap = await withTimeout(getDoc(doc(db, "posts", id)));
     if (!snap.exists()) { detail.state = "missing"; return; }
     detail.post = { id, ...snap.data() };
     await loadComments();
     detail.state = "ok";
   } catch (e) {
-    detail.state = e.code === "permission-denied" ? "hidden" : "error";
-    if (detail.state === "error") toast(errMsg(e));
+    console.error(e);
+    detail.err = e;
+    detail.state = e.code === "permission-denied" && !isAdmin ? "hidden" : "error";
   }
 }
 async function loadComments() {
@@ -351,6 +382,10 @@ function renderFeed() {
     frag.append(h("div", { class: "admin-bar" },
       h("strong", {}, "가려진 글 목록"), h("a", { href: "#/" }, "← 전체 글로")));
   }
+  if (feed.error) {
+    frag.append(errorBox(feed.error, async () => { await loadFeed(true, feed.mode); render(); }));
+    return frag;
+  }
   if (!feed.loaded && feed.loading) frag.append(h("p", { class: "empty" }, "불러오는 중…"));
   const shown = feed.posts.filter((p) => isAdmin || !p.deleted || p.commentCount > 0);
   if (feed.loaded && shown.length === 0) {
@@ -375,7 +410,7 @@ function renderDetail() {
   if (!detail || detail.state === "loading") { wrap.append(h("p", { class: "empty" }, "불러오는 중…")); return wrap; }
   if (detail.state === "missing") { wrap.append(h("p", { class: "empty" }, "존재하지 않는 글이에요.")); return wrap; }
   if (detail.state === "hidden") { wrap.append(h("p", { class: "empty" }, t.hidden)); return wrap; }
-  if (detail.state === "error") { wrap.append(h("p", { class: "empty" }, "글을 불러오지 못했어요.")); return wrap; }
+  if (detail.state === "error") { wrap.append(errorBox(detail.err, async () => { await loadDetail(detail.id); render(); })); return wrap; }
 
   const p = detail.post;
   wrap.append(postCard(p, { inDetail: true }));
@@ -447,6 +482,7 @@ function openCompose() {
   const count = h("span", { class: "count" }, `0 / ${POST_MAX}`);
   const pw = h("input", { class: "input", type: "password", placeholder: "삭제 비밀번호 (선택)", autocomplete: "new-password", maxlength: "40" });
   const btn = h("button", { type: "submit", class: "btn primary" }, t.submit);
+  const errEl = h("div", { class: "form-error", hidden: true });
   ta.addEventListener("input", () => (count.textContent = `${ta.value.length} / ${POST_MAX}`));
   const form = h("form", {
     class: "compose",
@@ -454,21 +490,31 @@ function openCompose() {
       e.preventDefault();
       const body = ta.value.trim();
       if (!body) { toast("내용을 입력해주세요."); return; }
+      if (!me) { toast("아직 연결 중이에요. 잠시 후 다시 눌러주세요."); return; }
       btn.disabled = true;
+      errEl.hidden = true;
       try {
-        const id = await createPost(body, pw.value);
+        const id = await withTimeout(createPost(body, pw.value));
         close();
         toast("등록되었어요.");
         await loadFeed(true, "open");
         location.hash = "#/";
         render();
         void id;
-      } catch (err) { toast(errMsg(err)); btn.disabled = false; }
+      } catch (err) {
+        console.error(err);
+        const d = errDetail(err);
+        errEl.innerHTML = "";
+        errEl.append(h("strong", {}, errMsg(err)), d.hint ? h("p", {}, d.hint) : null, h("p", { class: "error-code" }, `${d.code}: ${d.msg}`));
+        errEl.hidden = false;
+        btn.disabled = false;
+      }
     },
   },
   h("div", { class: "compose-head" }, h("strong", {}, t.composeTitle), count),
   ta,
   pw,
+  errEl,
   h("p", { class: "hint" }, "비밀번호를 정해두면 다른 기기나 앱에서도 이 글을 삭제할 수 있어요. 정하지 않으면 지금 쓰는 브라우저에서만 삭제할 수 있어요."),
   h("div", { class: "row-end" },
     h("button", { type: "button", class: "btn ghost", onclick: () => close() }, "취소"), btn));
@@ -659,7 +705,11 @@ render();
 onAuthStateChanged(auth, async (u) => {
   if (!u) {
     try { await signInAnonymously(auth); }
-    catch (e) { toast("연결에 실패했어요. 새로고침 해주세요."); console.error(e); }
+    catch (e) {
+      console.error(e);
+      feed.error = e;
+      render();
+    }
     return;
   }
   me = u;
