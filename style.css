@@ -291,3 +291,9 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .error-box p, .form-error p { margin: 6px 0 0; }
 .error-box .btn { margin-top: 10px; }
 .error-code { font-family: var(--font-no); font-size: 11.5px; color: var(--sub); word-break: break-all; }
+
+/* ═════════════ 관리자 표시 ═════════════ */
+.owner-tag { font-family: var(--font-no); font-weight: 700; }
+.owner-tag.banned { text-decoration: line-through; }
+.ban-row { display: flex; justify-content: space-between; align-items: center; padding: 8px 0; border-bottom: 1px solid var(--line); font-family: var(--font-no); }
+.ban-row small { color: var(--sub); font-family: var(--font-body); }

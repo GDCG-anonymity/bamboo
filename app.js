@@ -5,7 +5,8 @@ import {
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
 import {
   getFirestore, connectFirestoreEmulator, collection, doc, query, where, orderBy, limit,
-  startAfter, getDocs, getDoc, runTransaction, writeBatch, updateDoc, serverTimestamp
+  startAfter, getDocs, getDoc, runTransaction, writeBatch, updateDoc, serverTimestamp,
+  setDoc, deleteDoc
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 import { firebaseConfig, ADMIN_EMAIL, DATABASE_ID } from "./firebase-config.js";
 
@@ -142,7 +143,7 @@ function errMsg(e) {
   console.error(e);
   if (e && e.message && e.message.startsWith("!")) return e.message.slice(1);
   const code = e && e.code ? ` (${e.code})` : "";
-  if (e && e.code === "permission-denied") return "너무 빠르게 작성했거나 권한이 없어요. 잠시 후 다시 시도해주세요." + code;
+  if (e && e.code === "permission-denied") return "너무 빠르게 작성했거나, 작성이 제한된 상태예요. 잠시 후 다시 시도해주세요." + code;
   if (e && (e.code === "unavailable" || e.code === "deadline-exceeded")) return "서버에 연결하지 못했어요. 잠시 후 다시 시도해주세요." + code;
   if (e && e.code === "failed-precondition") return "데이터베이스 색인이 아직 준비되지 않았어요." + code;
   return "문제가 생겼어요. 잠시 후 다시 시도해주세요." + code;
@@ -361,7 +362,8 @@ function postCard(p, { inDetail = false } = {}) {
     p.deleted
       ? h("p", { class: "post-body muted" }, t.deleted)
       : h("div", { class: "post-body" }, p.body),
-    isAdmin && p.hidden ? h("p", { class: "admin-note" }, `가려진 글 · 신고 ${p.reportCount}회`) : null,
+    isAdmin ? h("p", { class: "admin-note" }, ownerTag(`posts/${p.id}`),
+      p.hidden ? ` · 가려진 글 · 신고 ${p.reportCount}회` : (p.reportCount ? ` · 신고 ${p.reportCount}회` : "")) : null,
     inDetail ? null : h("footer", { class: "post-foot" },
       h("a", { class: "cmt-link", href: `#/p/${p.id}` }, `${t.comments} ${p.commentCount || 0}`)));
   if (!inDetail) {
@@ -437,7 +439,8 @@ function commentItem(c) {
         type: "button", class: "more", "aria-label": "더보기", onclick: () => commentMenu(c),
       }, "⋯")),
     c.deleted ? h("p", { class: "c-body muted" }, t.cDeleted) : h("p", { class: "c-body" }, c.body),
-    isAdmin && c.hidden ? h("p", { class: "admin-note" }, `가려진 댓글 · 신고 ${c.reportCount}회`) : null);
+    isAdmin ? h("p", { class: "admin-note" }, ownerTag(`posts/${detail.id}/comments/${c.id}`),
+      c.hidden ? ` · 가려진 댓글 · 신고 ${c.reportCount}회` : (c.reportCount ? ` · 신고 ${c.reportCount}회` : "")) : null);
 }
 function commentForm() {
   const t = T();
@@ -538,6 +541,7 @@ async function createPost(body, password) {
       hasPw: !!secretH,
     });
     if (secretH) tx.set(doc(postRef, "secret", "del"), { h: secretH });
+    tx.set(doc(postRef, "owner", "info"), { uid: me.uid });
     tx.set(limRef, { lastPost: serverTimestamp() }, { merge: true });
   });
   return postRef.id;
@@ -567,8 +571,62 @@ async function addComment(postId, body) {
     }
     tx.update(postRef, upd);
     tx.set(cRef, { body, createdAt: serverTimestamp(), ck, n, hidden: false, deleted: false, reportCount: 0 });
+    tx.set(doc(cRef, "owner", "info"), { uid: me.uid });
     tx.set(limRef, { lastComment: serverTimestamp() }, { merge: true });
   });
+}
+
+/* ───────────── 관리자: 작성자 식별 ───────────── */
+// 관리자에게만 보이는 작성자 식별 코드. 같은 사람(같은 브라우저)이면 모든 글·댓글에서 같은 코드가 나옴.
+const ownerCache = new Map(); // path -> { uid, code, banned } | null
+async function ownerOf(path) {
+  if (ownerCache.has(path)) return ownerCache.get(path);
+  let info = null;
+  try {
+    const s = await getDoc(doc(db, path, "owner", "info"));
+    if (s.exists()) {
+      const uid = s.data().uid;
+      info = { uid, code: "#" + (await sha("id:" + uid)).slice(0, 6).toUpperCase() };
+    }
+  } catch (e) { console.error(e); }
+  ownerCache.set(path, info);
+  return info;
+}
+const banCache = new Map();
+async function isBanned(uid) {
+  if (banCache.has(uid)) return banCache.get(uid);
+  let b = false;
+  try { b = (await getDoc(doc(db, "bans", uid))).exists(); } catch (e) { console.error(e); }
+  banCache.set(uid, b);
+  return b;
+}
+// 관리자 화면에서 작성자 코드 칸을 비동기로 채움
+function ownerTag(path) {
+  const el = h("span", { class: "owner-tag" }, "작성자 확인 중…");
+  ownerOf(path).then(async (o) => {
+    if (!o) { el.textContent = "작성자 기록 없음"; return; }
+    const banned = await isBanned(o.uid);
+    el.textContent = `작성자 ${o.code}${banned ? " · 차단됨" : ""}`;
+    el.classList.toggle("banned", banned);
+  });
+  return el;
+}
+async function toggleBan(path) {
+  const o = await ownerOf(path);
+  if (!o) { toast("이 글은 작성자 기록이 없어요."); return false; }
+  const banned = await isBanned(o.uid);
+  if (banned) {
+    if (!(await confirmBox(`작성자 ${o.code}의 차단을 풀까요?`, "차단 해제"))) return false;
+    await deleteDoc(doc(db, "bans", o.uid));
+    banCache.set(o.uid, false);
+    toast("차단을 해제했어요.");
+  } else {
+    if (!(await confirmBox(`작성자 ${o.code}를 차단할까요?\n차단되면 이 사람은 새 글과 댓글을 쓸 수 없어요.\n(브라우저를 바꾸면 피할 수 있어서 완벽하진 않아요)`, "차단", true))) return false;
+    await setDoc(doc(db, "bans", o.uid), { code: o.code, at: serverTimestamp() });
+    banCache.set(o.uid, true);
+    toast("차단했어요.");
+  }
+  return true;
 }
 
 /* ───────────── 글 메뉴 ───────────── */
@@ -581,6 +639,7 @@ async function postMenu(p) {
   if (isAdmin) {
     if (p.hidden) items.push({ key: "unhide", label: "[관리] 가림 해제" });
     else items.push({ key: "hide", label: "[관리] 가리기" });
+    items.push({ key: "ban", label: "[관리] 작성자 차단 / 해제", danger: true });
   }
   const k = await menu(items);
   try {
@@ -589,6 +648,7 @@ async function postMenu(p) {
     else if (k === "delete") await deletePost(p, mine);
     else if (k === "unhide") { await updateDoc(doc(db, "posts", p.id), { hidden: false, reportCount: 0 }); toast("가림을 해제했어요."); await afterChange(p.id); }
     else if (k === "hide") { await updateDoc(doc(db, "posts", p.id), { hidden: true }); toast("글을 가렸어요."); await afterChange(p.id); }
+    else if (k === "ban") { if (await toggleBan(`posts/${p.id}`)) render(); }
   } catch (e) { toast(errMsg(e)); }
 }
 async function afterChange(postId) {
@@ -641,7 +701,10 @@ async function commentMenu(c) {
   const items = [];
   if (!c.deleted && !mine) items.push({ key: "report", label: t.report, danger: true });
   if (!c.deleted && (mine || isAdmin)) items.push({ key: "delete", label: isAdmin && !mine ? "[관리] 삭제" : "삭제", danger: true });
-  if (isAdmin) items.push(c.hidden ? { key: "unhide", label: "[관리] 가림 해제" } : { key: "hide", label: "[관리] 가리기" });
+  if (isAdmin) {
+    items.push(c.hidden ? { key: "unhide", label: "[관리] 가림 해제" } : { key: "hide", label: "[관리] 가리기" });
+    items.push({ key: "ban", label: "[관리] 작성자 차단 / 해제", danger: true });
+  }
   if (!items.length) { toast("이 댓글은 작성한 브라우저에서만 삭제할 수 있어요."); return; }
   const k = await menu(items);
   const cRef = doc(db, "posts", detail.id, "comments", c.id);
@@ -664,6 +727,9 @@ async function commentMenu(c) {
       toast("삭제했어요.");
     } else if (k === "unhide") {
       await updateDoc(cRef, { hidden: false, reportCount: 0 });
+    } else if (k === "ban") {
+      if (await toggleBan(`posts/${detail.id}/comments/${c.id}`)) render();
+      return;
     } else if (k === "hide") {
       await updateDoc(cRef, { hidden: true });
     } else return;
@@ -672,12 +738,37 @@ async function commentMenu(c) {
 }
 
 /* ───────────── 관리자 ───────────── */
+async function showBans() {
+  let snap;
+  try { snap = await getDocs(collection(db, "bans")); }
+  catch (e) { toast(errMsg(e)); return; }
+  const list = h("div", { class: "menu" });
+  if (snap.empty) list.append(h("p", { class: "empty small" }, "차단한 작성자가 없어요."));
+  snap.forEach((d) => {
+    const v = d.data();
+    const row = h("div", { class: "ban-row" },
+      h("span", {}, v.code || d.id.slice(0, 6), h("small", {}, v.at ? ` · ${rel(v.at)}` : "")),
+      h("button", {
+        type: "button", class: "btn ghost small",
+        onclick: async () => {
+          await deleteDoc(doc(db, "bans", d.id));
+          banCache.set(d.id, false);
+          row.remove(); toast("차단을 해제했어요."); render();
+        },
+      }, "해제"));
+    list.append(row);
+  });
+  const close = openSheet(h("div", { class: "dialog" }, h("strong", {}, "차단 목록"), list,
+    h("div", { class: "row-end" }, h("button", { type: "button", class: "btn ghost", onclick: () => close() }, "닫기"))));
+}
 async function adminClick() {
   if (isAdmin) {
     const k = await menu([
       { key: "hidden", label: "가려진 글 보기" },
+      { key: "bans", label: "차단 목록" },
       { key: "logout", label: "관리자 로그아웃", danger: true },
     ]);
+    if (k === "bans") { await showBans(); return; }
     if (k === "hidden") location.hash = "#/hidden";
     if (k === "logout") { await signOut(auth); toast("로그아웃했어요."); }
     return;
