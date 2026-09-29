@@ -1,0 +1,198 @@
+rules_version = '2';
+
+// ─────────────────────────────────────────────
+// "○○에서 전해드립니다" 익명 게시판 보안 규칙
+// ※ ADMIN_EMAIL 을 firebase-config.js 의 값과 똑같이 바꿔주세요.
+// ─────────────────────────────────────────────
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isAdmin() {
+      return request.auth != null
+        && 'email' in request.auth.token
+        && request.auth.token.email == 'research1@bamboo.local';
+    }
+    function signedIn() { return request.auth != null; }
+
+    // 글마다 달라지는 익명 키: sha256(uid + ':' + 글ID)
+    // → 같은 글 안에서는 같은 사람으로 묶이지만, 다른 글끼리는 연결되지 않음
+    function keyOf(postId) {
+      return hashing.sha256(request.auth.uid + ':' + postId).toHexString().lower();
+    }
+    function onlyChanged(keys) {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys);
+    }
+    function limitsPath() {
+      return /databases/$(database)/documents/limits/$(request.auth.uid);
+    }
+    // 도배 방지: field(lastPost/lastComment)를 이번 요청 시각으로 갱신했고,
+    // 직전 기록이 sec 초보다 오래됐어야 함
+    function rateOk(field, sec) {
+      return getAfter(limitsPath()).data[field] == request.time
+        && (!exists(limitsPath())
+            || !(field in get(limitsPath()).data)
+            || get(limitsPath()).data[field] < request.time - duration.value(sec, 's'));
+    }
+
+    // ── 글 번호 카운터 ──
+    match /meta/counter {
+      allow read: if true;
+      allow create: if signedIn() && request.resource.data.keys().hasOnly(['last'])
+        && request.resource.data.last == 1;
+      allow update: if signedIn() && request.resource.data.keys().hasOnly(['last'])
+        && request.resource.data.last == resource.data.last + 1;
+    }
+
+    // ── 도배 방지 기록 (본인만) ──
+    match /limits/{uid} {
+      function fieldOk(f) {
+        return !(f in request.resource.data)
+          || request.resource.data[f] == request.time
+          || (resource != null && f in resource.data
+              && request.resource.data[f] == resource.data[f]);
+      }
+      allow read: if signedIn() && request.auth.uid == uid;
+      allow create, update: if signedIn() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['lastPost', 'lastComment'])
+        && fieldOk('lastPost') && fieldOk('lastComment');
+    }
+
+    // ── 글 ──
+    match /posts/{postId} {
+      function counterPath() { return /databases/$(database)/documents/meta/counter; }
+      function secretPath() { return /databases/$(database)/documents/posts/$(postId)/secret/del; }
+      function reportPath() { return /databases/$(database)/documents/posts/$(postId)/reports/$(keyOf(postId)); }
+
+      allow read: if isAdmin() || resource.data.hidden == false;
+
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['no', 'body', 'createdAt', 'ak', 'hidden', 'deleted',
+                                                   'reportCount', 'commentCount', 'memberCount', 'hasPw'])
+        && request.resource.data.body is string
+        && request.resource.data.body.size() >= 1
+        && request.resource.data.body.size() <= 2000
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.ak == keyOf(postId)
+        && request.resource.data.hidden == false
+        && request.resource.data.deleted == false
+        && request.resource.data.reportCount == 0
+        && request.resource.data.commentCount == 0
+        && request.resource.data.memberCount == 0
+        && request.resource.data.hasPw is bool
+        // 글 번호는 카운터와 일치해야 함
+        && request.resource.data.no == getAfter(counterPath()).data.last
+        && (exists(counterPath())
+              ? get(counterPath()).data.last == request.resource.data.no - 1
+              : request.resource.data.no == 1)
+        && rateOk('lastPost', 30);
+
+      allow update: if isAdmin()
+        || (signedIn() && (
+          // 1) 댓글이 달림
+          (resource.data.deleted == false
+            && onlyChanged(['commentCount', 'memberCount'])
+            && request.resource.data.commentCount == resource.data.commentCount + 1
+            && (request.resource.data.memberCount == resource.data.memberCount
+                || request.resource.data.memberCount == resource.data.memberCount + 1))
+          // 2) 신고 (한 사람당 1회, 3회 누적 시 자동 가림)
+          || (onlyChanged(['reportCount', 'hidden'])
+            && request.resource.data.reportCount == resource.data.reportCount + 1
+            && request.resource.data.hidden == (resource.data.hidden || request.resource.data.reportCount >= 3)
+            && !exists(reportPath()) && existsAfter(reportPath()))
+          // 3) 작성자 삭제 (같은 기기 or 삭제 비밀번호)
+          || (onlyChanged(['deleted', 'body'])
+            && request.resource.data.deleted == true
+            && request.resource.data.body == ''
+            && (resource.data.ak == keyOf(postId)
+                || (resource.data.hasPw == true
+                    && hashing.sha256(getAfter(secretPath()).data.attempt).toHexString().lower()
+                       == get(secretPath()).data.h)))
+        ));
+
+      allow delete: if isAdmin();
+
+      // 삭제 비밀번호 (해시만 저장, 관리자 외 읽기 불가)
+      match /secret/{d} {
+        allow read: if isAdmin();
+        allow create: if signedIn() && d == 'del'
+          && !exists(/databases/$(database)/documents/posts/$(postId))
+          && getAfter(/databases/$(database)/documents/posts/$(postId)).data.ak == keyOf(postId)
+          && request.resource.data.keys().hasOnly(['h'])
+          && request.resource.data.h is string && request.resource.data.h.size() == 64;
+        allow update: if signedIn()
+          && onlyChanged(['attempt'])
+          && request.resource.data.attempt is string
+          && hashing.sha256(request.resource.data.attempt).toHexString().lower() == resource.data.h;
+        allow delete: if isAdmin();
+      }
+
+      // 글별 댓글 익명 번호표 (문서 ID = 익명 키)
+      match /members/{mk} {
+        allow read: if isAdmin() || (signedIn() && mk == keyOf(postId));
+        allow create: if signedIn() && mk == keyOf(postId)
+          && mk != get(/databases/$(database)/documents/posts/$(postId)).data.ak
+          && request.resource.data.keys().hasOnly(['n'])
+          && request.resource.data.n == get(/databases/$(database)/documents/posts/$(postId)).data.memberCount + 1
+          && getAfter(/databases/$(database)/documents/posts/$(postId)).data.memberCount == request.resource.data.n;
+        allow delete: if isAdmin();
+      }
+
+      // 글 신고 기록 (문서 ID = 익명 키 → 1인 1회)
+      match /reports/{rk} {
+        allow read: if isAdmin() || (signedIn() && rk == keyOf(postId));
+        allow create: if signedIn() && rk == keyOf(postId)
+          && request.resource.data.keys().hasOnly(['at'])
+          && request.resource.data.at == request.time;
+        allow delete: if isAdmin();
+      }
+
+      // ── 댓글 ──
+      match /comments/{cid} {
+        function postPath() { return /databases/$(database)/documents/posts/$(postId); }
+        function memberPath() { return /databases/$(database)/documents/posts/$(postId)/members/$(keyOf(postId)); }
+        function creportPath() { return /databases/$(database)/documents/posts/$(postId)/comments/$(cid)/reports/$(keyOf(postId)); }
+
+        allow read: if isAdmin() || resource.data.hidden == false;
+
+        allow create: if signedIn()
+          && request.resource.data.keys().hasOnly(['body', 'createdAt', 'ck', 'n', 'hidden', 'deleted', 'reportCount'])
+          && request.resource.data.body is string
+          && request.resource.data.body.size() >= 1
+          && request.resource.data.body.size() <= 500
+          && request.resource.data.createdAt == request.time
+          && request.resource.data.ck == keyOf(postId)
+          && request.resource.data.hidden == false
+          && request.resource.data.deleted == false
+          && request.resource.data.reportCount == 0
+          && get(postPath()).data.deleted == false
+          && getAfter(postPath()).data.commentCount == get(postPath()).data.commentCount + 1
+          && (keyOf(postId) == get(postPath()).data.ak
+                ? request.resource.data.n == 0
+                : request.resource.data.n == getAfter(memberPath()).data.n)
+          && rateOk('lastComment', 10);
+
+        allow update: if isAdmin()
+          || (signedIn() && (
+            (onlyChanged(['reportCount', 'hidden'])
+              && request.resource.data.reportCount == resource.data.reportCount + 1
+              && request.resource.data.hidden == (resource.data.hidden || request.resource.data.reportCount >= 3)
+              && !exists(creportPath()) && existsAfter(creportPath()))
+            || (onlyChanged(['deleted', 'body'])
+              && request.resource.data.deleted == true
+              && request.resource.data.body == ''
+              && resource.data.ck == keyOf(postId))
+          ));
+
+        allow delete: if isAdmin();
+
+        match /reports/{rk} {
+          allow read: if isAdmin() || (signedIn() && rk == keyOf(postId));
+          allow create: if signedIn() && rk == keyOf(postId)
+            && request.resource.data.keys().hasOnly(['at'])
+            && request.resource.data.at == request.time;
+          allow delete: if isAdmin();
+        }
+      }
+    }
+  }
+}
