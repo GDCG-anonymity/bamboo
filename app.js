@@ -7,12 +7,12 @@ import {
   getFirestore, connectFirestoreEmulator, collection, doc, query, where, orderBy, limit,
   startAfter, getDocs, getDoc, runTransaction, writeBatch, updateDoc, serverTimestamp
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
-import { firebaseConfig, ADMIN_EMAIL } from "./firebase-config.js";
+import { firebaseConfig, ADMIN_EMAIL, DATABASE_ID } from "./firebase-config.js";
 
 /* ───────────── Firebase ───────────── */
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
-const db = getFirestore(app);
+const db = DATABASE_ID ? getFirestore(app, DATABASE_ID) : getFirestore(app);
 if (location.hostname === "localhost" && new URLSearchParams(location.search).has("emu")) {
   connectAuthEmulator(auth, "http://localhost:9099", { disableWarnings: true });
   connectFirestoreEmulator(db, "localhost", 8080);
